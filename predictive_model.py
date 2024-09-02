@@ -3,7 +3,9 @@ from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error
 from Load_Energy_Plans import select_excel_file, load_excel_file
-from database_functions import save_df_to_db, connect_to_postgres, load_data_from_db, create_table_if_not_exists
+from database_functions import save_df_to_db, connect_to_postgres, load_data_from_db, create_table_if_not_exists, connect_to_postgres_sqlalchemy
+from sqlalchemy import create_engine, text
+from config import get_postgres_keys
 
 def convert_period_start_to_datetime(df, column_name):
     """
@@ -26,20 +28,55 @@ def clean_weather_data(df):
     """
     # Strip "°F" from temperature and dew_point, convert to integers
     df.loc[:, 'temperature'] = df['temperature'].str.replace('°F', '').astype(float)
-    # df['dew_point'] = df['dew_point'].str.replace('°F', '').astype(float)
 
-    # Strip "%" from humidity, convert to integers
-    df.loc[:, 'humidity'] = df['humidity'].str.replace('°%', '').astype(float)
-
-    # Strip "°mph" from wind_speed and wind_gust, convert to integers
-    # df['wind_speed'] = df['wind_speed'].str.replace('°mph', '').astype(float)
-    # df['wind_gust'] = df['wind_gust'].str.replace('°mph', '').astype(float)
-
-    # Strip "°in" from pressure and precipitation, convert to floats
-    # df['pressure'] = df['pressure'].str.replace('°in', '').astype(float)
-    # df['precipitation'] = df['precipitation'].str.replace('°in', '').astype(float)
+    # Strip "°%" or "%" from humidity and convert to float
+    df.loc[:, 'humidity'] = df['humidity'].str.replace(r'[°%]', '', regex=True).astype(float)
 
     return df
+
+def create_predictive_model_summary_table():
+    """
+    Create a PostgreSQL table to store the summary of the predictive model's performance.
+    """
+    # Connect to your PostgreSQL database using SQLAlchemy
+    engine = connect_to_postgres_sqlalchemy()
+
+    # SQL query to create the table
+    create_table_query = """
+    CREATE TABLE IF NOT EXISTS predictive_model_summary (
+        date DATE,
+        actual_kwh FLOAT,
+        predicted_kwh FLOAT,
+        absolute_error FLOAT,
+        cumulative_mae FLOAT
+    );
+    """
+
+    # Execute the SQL query to create the table
+    with engine.connect() as conn:
+        conn.execute(text(create_table_query))
+        print("Table 'predictive_model_summary' created successfully.")
+
+def populate_aggregate_table(X_test, y_test, predictions, datetime_test):
+    """
+    Populate the PostgreSQL table with the test data, model predictions, and the 'DateTime' column.
+    """
+    # Create the summary DataFrame, including the 'DateTime' column
+    summary_df = pd.DataFrame({
+        'DateTime': datetime_test,  # Use the split 'DateTime' column here
+        'actual_kwh': y_test,
+        'predicted_kwh': predictions
+    })
+    
+    # Calculate absolute error and cumulative MAE
+    summary_df['absolute_error'] = abs(summary_df['actual_kwh'] - summary_df['predicted_kwh'])
+    summary_df['cumulative_mae'] = summary_df['absolute_error'].expanding().mean()
+
+    # Insert the data into the database
+    engine = connect_to_postgres_sqlalchemy()
+    summary_df[['DateTime', 'actual_kwh', 'predicted_kwh', 'absolute_error', 'cumulative_mae']].to_sql(
+        'predictive_model_summary', engine, if_exists='replace', index=False
+    )
 
 def load_and_merge_data(usage_file, weather_query):
     """
@@ -92,14 +129,19 @@ def train_model(filtered_df):
         filtered_df (pd.DataFrame): Preprocessed and filtered data.
     
     Returns:
-        model: Trained machine learning model.
+        model, X_test, y_test, predictions: Trained machine learning model and test data with predictions.
     """
     # Features and target variable
-    X = filtered_df[['temperature', 'temp_diff', 'humidity', 'month', 'hour']]
+    x = filtered_df[['temperature', 'temp_diff', 'humidity', 'month', 'hour']]
     y = filtered_df['Usage (kWh)']
 
-    # Train-test split
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    # Retain 'datetime' for later use in the summary table
+    datetime_col = filtered_df['DateTime']
+
+    # Perform train-test split (datetime is not part of X, but is split separately)
+    X_train, X_test, y_train, y_test, datetime_train, datetime_test = train_test_split(
+        x, y, datetime_col, test_size=0.2, random_state=42
+    )
 
     # Train model (Random Forest)
     model = RandomForestRegressor(n_estimators=100, random_state=42)
@@ -112,7 +154,8 @@ def train_model(filtered_df):
     mae = mean_absolute_error(y_test, predictions)
     print(f'MAE: {mae}')
     
-    return model
+    # Return model, X_test, y_test, and predictions
+    return model, X_test, y_test, predictions, datetime_test
 
 def predict_yearly_usage(model, location_query):
     """
@@ -160,7 +203,7 @@ def main():
     filtered_df = preprocess_data(merged_df)
     
     # Step 5: Train the Random Forest model
-    model = train_model(filtered_df)
+    model, X_test, y_test, predictions, datetime_test = train_model(filtered_df)
     
     # Step 6: Predict yearly usage based on weather data
     location_query = "SELECT * FROM weather WHERE location = 'tx_houston_KIAH'"
@@ -168,6 +211,11 @@ def main():
     
     # Step 7: Save the predictions to the database
     save_df_to_db(full_year_weather_with_predictions, 'predicted_yearly_usage', mode='replace')
+
+    # Step 8: Create and populate summary table for predictive model based on test data
+    create_predictive_model_summary_table()
+    populate_aggregate_table(X_test, y_test, predictions, datetime_test)
+
 
 if __name__ == "__main__":
     main()
